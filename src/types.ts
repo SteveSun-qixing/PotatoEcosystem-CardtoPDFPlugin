@@ -14,6 +14,8 @@ import type {
   ConversionSource,
   ConversionError,
   ErrorCode,
+  ConversionAppearanceProfile,
+  DeepPartial,
 } from '@chips/cardto-html-plugin';
 
 // 重新导出
@@ -108,6 +110,16 @@ export interface PDFConversionOptions {
    * @remarks 覆盖卡片默认主题
    */
   themeId?: string;
+
+  /**
+   * 外观配置表 ID（由转换模块统一管理）
+   */
+  appearanceProfileId?: string;
+
+  /**
+   * 外观参数覆盖（用于后续扩展）
+   */
+  appearanceOverrides?: DeepPartial<Omit<ConversionAppearanceProfile, 'id' | 'description'>>;
 
   /**
    * 进度回调函数

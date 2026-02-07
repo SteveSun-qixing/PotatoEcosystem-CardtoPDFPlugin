@@ -9,16 +9,21 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
-import type { ConversionSource } from '@chips/cardto-html-plugin';
-import { CardtoHTMLPlugin } from '@chips/cardto-html-plugin';
+import type {
+  ConversionSource,
+  ConversionAppearanceProfile,
+} from '@chips/cardto-html-plugin';
+import {
+  CardtoHTMLPlugin,
+  ErrorCode,
+  resolveConversionAppearance,
+} from '@chips/cardto-html-plugin';
 import type {
   PageFormat,
   PageOrientation,
-  PageMargin,
   PDFConversionOptions,
   PDFConversionResult,
   PDFConverterPlugin,
-  PDFProgressInfo,
   PDFConversionStatus,
   PDFValidationResult,
 } from './types';
@@ -45,18 +50,10 @@ const PLUGIN_METADATA = {
  * 默认转换选项
  * @internal
  */
-const DEFAULT_OPTIONS: Required<
-  Omit<PDFConversionOptions, 'outputPath' | 'themeId' | 'onProgress' | 'headerTemplate' | 'footerTemplate'>
+const DEFAULT_OPTIONS: Pick<
+  PDFConversionOptions,
+  'displayHeaderFooter' | 'generateOutline'
 > = {
-  format: 'a4',
-  orientation: 'portrait',
-  margin: {
-    top: '15mm',
-    right: '15mm',
-    bottom: '15mm',
-    left: '15mm',
-  },
-  printBackground: true,
   displayHeaderFooter: false,
   generateOutline: false,
 };
@@ -102,7 +99,7 @@ export class CardtoPDFPlugin implements PDFConverterPlugin {
   readonly version = PLUGIN_METADATA.version;
 
   /** 支持的源类型 */
-  readonly sourceTypes = PLUGIN_METADATA.sourceTypes;
+  readonly sourceTypes = [...PLUGIN_METADATA.sourceTypes];
 
   /** 目标类型 */
   readonly targetType = PLUGIN_METADATA.targetType;
@@ -171,10 +168,16 @@ export class CardtoPDFPlugin implements PDFConverterPlugin {
 
       // 阶段 1: HTML 转换
       reportProgress('converting-html', 0, '正在解析卡片并生成 HTML');
+      const appearance = resolveConversionAppearance({
+        profileId: mergedOptions.appearanceProfileId,
+        overrides: mergedOptions.appearanceOverrides,
+      });
 
       const htmlResult = await this._htmlPlugin.convert(source, {
         themeId: mergedOptions.themeId,
         includeAssets: true,
+        appearanceProfileId: appearance.id,
+        appearanceOverrides: mergedOptions.appearanceOverrides,
       });
 
       if (!htmlResult.success || !htmlResult.data) {
@@ -183,7 +186,7 @@ export class CardtoPDFPlugin implements PDFConverterPlugin {
           success: false,
           taskId,
           error: htmlResult.error ?? {
-            code: 'CONV-HTML-002' as const,
+            code: ErrorCode.RENDER_FAILED,
             message: 'HTML 转换失败',
           },
           duration: Date.now() - startTime,
@@ -197,7 +200,9 @@ export class CardtoPDFPlugin implements PDFConverterPlugin {
 
       const { pdfData, pageCount } = await this._renderHTMLToPDF(
         htmlResult.data.files,
-        mergedOptions
+        mergedOptions,
+        options,
+        appearance
       );
 
       reportProgress('generating', 80, '正在生成 PDF');
@@ -239,9 +244,13 @@ export class CardtoPDFPlugin implements PDFConverterPlugin {
    * 获取默认选项
    */
   getDefaultOptions(): PDFConversionOptions {
+    const appearance = resolveConversionAppearance();
     return {
+      format: appearance.pdf.pageFormat,
+      orientation: appearance.pdf.orientation,
+      margin: { ...appearance.pdf.margin },
+      printBackground: appearance.pdf.printBackground,
       ...DEFAULT_OPTIONS,
-      margin: { ...DEFAULT_OPTIONS.margin },
     };
   }
 
@@ -298,10 +307,6 @@ export class CardtoPDFPlugin implements PDFConverterPlugin {
     return {
       ...DEFAULT_OPTIONS,
       ...options,
-      margin: {
-        ...DEFAULT_OPTIONS.margin,
-        ...options?.margin,
-      },
     };
   }
 
@@ -338,7 +343,9 @@ export class CardtoPDFPlugin implements PDFConverterPlugin {
    */
   private async _renderHTMLToPDF(
     files: Map<string, string | Uint8Array>,
-    options: PDFConversionOptions
+    mergedOptions: PDFConversionOptions,
+    rawOptions: PDFConversionOptions | undefined,
+    appearance: ConversionAppearanceProfile
   ): Promise<{ pdfData: Uint8Array; pageCount: number }> {
     // 动态导入 Puppeteer
     let puppeteer: typeof import('puppeteer') | undefined;
@@ -369,6 +376,17 @@ export class CardtoPDFPlugin implements PDFConverterPlugin {
 
     try {
       const page = await browser.newPage();
+      const viewportWidth = appearance.pdf.viewportWidthPx;
+      const viewportHeight = appearance.pdf.viewportHeightPx;
+      const pageFormat = (rawOptions?.format ?? appearance.pdf.pageFormat).toUpperCase() as Uppercase<PageFormat>;
+      const orientation = rawOptions?.orientation ?? appearance.pdf.orientation;
+      const margin = rawOptions?.margin ?? appearance.pdf.margin;
+      const printBackground = rawOptions?.printBackground ?? appearance.pdf.printBackground;
+
+      await page.setViewport({
+        width: viewportWidth,
+        height: viewportHeight,
+      });
 
       // 内联资源
       const htmlContent = this._inlineResources(indexHtml, files);
@@ -379,13 +397,13 @@ export class CardtoPDFPlugin implements PDFConverterPlugin {
 
       // 配置 PDF 选项
       const pdfOptions: Parameters<typeof page.pdf>[0] = {
-        format: options.format?.toUpperCase() as Uppercase<PageFormat>,
-        landscape: options.orientation === 'landscape',
-        printBackground: options.printBackground ?? true,
-        margin: options.margin,
-        displayHeaderFooter: options.displayHeaderFooter ?? false,
-        headerTemplate: options.headerTemplate ?? '',
-        footerTemplate: options.footerTemplate ?? '',
+        format: pageFormat,
+        landscape: orientation === 'landscape',
+        printBackground,
+        margin,
+        displayHeaderFooter: mergedOptions.displayHeaderFooter ?? false,
+        headerTemplate: mergedOptions.headerTemplate ?? '',
+        footerTemplate: mergedOptions.footerTemplate ?? '',
         preferCSSPageSize: false,
       };
 
@@ -408,10 +426,10 @@ export class CardtoPDFPlugin implements PDFConverterPlugin {
    * 估算 PDF 页数
    * @internal
    */
-  private async _estimatePageCount(pdfBuffer: Buffer): Promise<number> {
+  private async _estimatePageCount(pdfBuffer: Uint8Array): Promise<number> {
     try {
       // 简单的 PDF 页数估算：查找 /Type /Page 出现次数
-      const pdfString = pdfBuffer.toString('binary');
+      const pdfString = Buffer.from(pdfBuffer).toString('binary');
       const matches = pdfString.match(/\/Type\s*\/Page[^s]/g);
       return matches ? matches.length : 1;
     } catch {
@@ -464,8 +482,9 @@ export class CardtoPDFPlugin implements PDFConverterPlugin {
         const base64 = this._uint8ArrayToBase64(content);
         const mimeType = this._getMimeType(filePath);
         const dataUrl = `data:${mimeType};base64,${base64}`;
-
         const filename = filePath.split('/').pop() ?? '';
+
+        // 替换 HTML 属性中的资源引用
         result = result.replace(
           new RegExp(
             `(src|href)=["']([^"']*${this._escapeRegex(filename)})["']`,
@@ -473,6 +492,18 @@ export class CardtoPDFPlugin implements PDFConverterPlugin {
           ),
           `$1="${dataUrl}"`
         );
+
+        // 替换脚本/JSON 中的路径引用（适配直出 DOM + CHIPS_CARD_CONFIG）
+        const normalizedPaths = [filePath, `./${filePath}`, filename];
+        for (const p of normalizedPaths) {
+          result = result.replace(
+            new RegExp(
+              `"(?:${this._escapeRegex(p)})"`,
+              'g'
+            ),
+            `"${dataUrl}"`
+          );
+        }
       }
     }
 
